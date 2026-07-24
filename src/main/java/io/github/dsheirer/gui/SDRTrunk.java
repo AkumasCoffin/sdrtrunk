@@ -30,6 +30,7 @@ import io.github.dsheirer.controller.channel.Channel;
 import io.github.dsheirer.controller.channel.ChannelAutoStartFrame;
 import io.github.dsheirer.controller.channel.ChannelException;
 import io.github.dsheirer.controller.channel.ChannelSelectionManager;
+import io.github.dsheirer.control.ControlServer;
 import io.github.dsheirer.eventbus.MyEventBus;
 import io.github.dsheirer.gui.icon.ViewIconManagerRequest;
 import io.github.dsheirer.gui.playlist.ViewPlaylistRequest;
@@ -137,6 +138,7 @@ public class SDRTrunk implements Listener<TunerEvent>
     private ApplicationLog mApplicationLog;
     private ResourceMonitor mResourceMonitor;
     private JFXPanel mResourceStatusPanel;
+    private ControlServer mControlServer;
 
     private String mTitle;
 
@@ -235,6 +237,9 @@ public class SDRTrunk implements Listener<TunerEvent>
         mTunerManager.getDiscoveredTunerModel().addListener(this);
 
         mPlaylistManager.init();
+
+        //Start the headless control server if a control port was specified on the command line.
+        startControlServer(headless);
 
         if(GraphicsEnvironment.isHeadless())
         {
@@ -618,12 +623,48 @@ public class SDRTrunk implements Listener<TunerEvent>
     }
 
     /**
+     * Starts the headless control server when the {@code sdrtrunk.control.port} system property has been set (from the
+     * {@code --control-port} command line argument).  The control auth token is read from the
+     * {@code SDRTRUNK_CONTROL_TOKEN} environment variable.
+     *
+     * @param headless true if the application is running headless.
+     */
+    private void startControlServer(boolean headless)
+    {
+        String portProperty = System.getProperty("sdrtrunk.control.port");
+
+        if(portProperty == null || portProperty.isEmpty())
+        {
+            return;
+        }
+
+        try
+        {
+            int port = Integer.parseInt(portProperty.trim());
+            String token = System.getenv("SDRTRUNK_CONTROL_TOKEN");
+            mControlServer = new ControlServer(mTunerManager, mPlaylistManager, mDiagnosticMonitor, headless, port, token);
+            mControlServer.start();
+            mLog.info("Headless control server started on port [" + port + "]");
+        }
+        catch(Exception e)
+        {
+            mLog.error("Unable to start headless control server on port [" + portProperty + "]", e);
+        }
+    }
+
+    /**
      * Performs shutdown operations
      */
     private void processShutdown()
     {
         mLog.info("Application shutdown started ...");
         mDiagnosticMonitor.stop();
+
+        if(mControlServer != null)
+        {
+            mControlServer.stop();
+        }
+
         mUserPreferences.getSwingPreference().setLocation(WINDOW_FRAME_IDENTIFIER, mMainGui.getLocation());
         mUserPreferences.getSwingPreference().setDimension(WINDOW_FRAME_IDENTIFIER, mMainGui.getSize());
         mUserPreferences.getSwingPreference().setMaximized(WINDOW_FRAME_IDENTIFIER,
@@ -919,9 +960,60 @@ public class SDRTrunk implements Listener<TunerEvent>
 
     /**
      * Launch the application.
+     *
+     * Supported command line arguments (parsed BEFORE any AWT/Swing class is touched):
+     *   --headless              run without a GUI (sets java.awt.headless=true).
+     *   --control-port &lt;int&gt;    start the headless control server on the given loopback port (WS on port+1).
+     *   --app-root &lt;dir&gt;        relocate the application root directory (best-effort via sdrtrunk.app.root property).
+     *
+     * The control auth token is read from the SDRTRUNK_CONTROL_TOKEN environment variable.
      */
     public static void main(String[] args)
     {
+        parseArguments(args);
         new SDRTrunk();
+    }
+
+    /**
+     * Parses command line arguments.  Must be invoked before any AWT/Swing class is referenced so that headless mode
+     * takes effect before the toolkit initializes.
+     *
+     * @param args command line arguments.
+     */
+    private static void parseArguments(String[] args)
+    {
+        if(args == null)
+        {
+            return;
+        }
+
+        for(int i = 0; i < args.length; i++)
+        {
+            String arg = args[i];
+
+            switch(arg)
+            {
+                case "--headless":
+                    //Must be the very first thing we do so the toolkit initializes headless.
+                    System.setProperty("java.awt.headless", "true");
+                    break;
+                case "--control-port":
+                    if(i + 1 < args.length)
+                    {
+                        System.setProperty("sdrtrunk.control.port", args[++i]);
+                    }
+                    break;
+                case "--app-root":
+                    if(i + 1 < args.length)
+                    {
+                        //Honored trivially by DirectoryPreference.getDefaultApplicationDirectory().
+                        System.setProperty("sdrtrunk.app.root", args[++i]);
+                    }
+                    break;
+                default:
+                    //ignore unrecognized arguments
+                    break;
+            }
+        }
     }
 }

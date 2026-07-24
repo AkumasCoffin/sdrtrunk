@@ -477,6 +477,15 @@ public class DirectoryPreference extends Preference
      */
     private Path getDefaultApplicationDirectory()
     {
+        //Allow a headless/control launch to relocate the application root via a system property.  This is a trivial,
+        //non-persisting override that only affects the default (used when no preference override is stored).
+        String override = System.getProperty("sdrtrunk.app.root");
+
+        if(override != null && !override.isEmpty())
+        {
+            return Paths.get(override);
+        }
+
         return Paths.get(System.getProperty("user.home"), DIRECTORY_APPLICATION_ROOT);
     }
 
