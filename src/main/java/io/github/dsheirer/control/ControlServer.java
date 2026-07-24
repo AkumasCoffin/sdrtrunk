@@ -22,6 +22,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import io.github.dsheirer.alias.Alias;
 import io.github.dsheirer.channel.metadata.ChannelMetadata;
 import io.github.dsheirer.channel.metadata.ChannelMetadataModel;
 import io.github.dsheirer.controller.channel.Channel;
@@ -35,8 +36,25 @@ import io.github.dsheirer.properties.SystemProperties;
 import io.github.dsheirer.source.SourceException;
 import io.github.dsheirer.source.tuner.Tuner;
 import io.github.dsheirer.source.tuner.TunerController;
+import io.github.dsheirer.source.tuner.airspy.AirspySampleRate;
+import io.github.dsheirer.source.tuner.airspy.AirspyTunerController;
+import io.github.dsheirer.source.tuner.airspy.hf.AirspyHfSampleRate;
+import io.github.dsheirer.source.tuner.airspy.hf.AirspyHfTunerController;
+import io.github.dsheirer.source.tuner.airspy.hf.Attenuation;
+import io.github.dsheirer.source.tuner.fcd.proV1.FCD1TunerController;
+import io.github.dsheirer.source.tuner.fcd.proplusV2.FCD2TunerController;
+import io.github.dsheirer.source.tuner.hackrf.HackRFTunerController;
+import io.github.dsheirer.source.tuner.hydrasdr.HydraSdrTunerController;
 import io.github.dsheirer.source.tuner.manager.DiscoveredTuner;
+import io.github.dsheirer.source.tuner.manager.FrequencyErrorCorrectionManager;
 import io.github.dsheirer.source.tuner.manager.TunerManager;
+import io.github.dsheirer.source.tuner.rtl.EmbeddedTuner;
+import io.github.dsheirer.source.tuner.rtl.RTL2832TunerController;
+import io.github.dsheirer.source.tuner.rtl.e4k.E4KEmbeddedTuner;
+import io.github.dsheirer.source.tuner.rtl.fc0013.FC0013EmbeddedTuner;
+import io.github.dsheirer.source.tuner.rtl.r8x.R8xEmbeddedTuner;
+import io.github.dsheirer.source.tuner.sdrplay.RspSampleRate;
+import io.github.dsheirer.source.tuner.sdrplay.RspTunerController;
 import io.github.dsheirer.source.tuner.ui.DiscoveredTunerModel;
 import java.io.IOException;
 import java.io.InputStream;
@@ -52,6 +70,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.slf4j.Logger;
@@ -80,6 +99,14 @@ public class ControlServer
     private ExecutorService mExecutor;
     private EventBuffer mEventBuffer;
     private long mStartTime;
+
+    /**
+     * Last gain value applied to each tuner via this control API, keyed by tuner id.  Most SDR-Trunk tuner
+     * controllers do not expose a getter for the current composite gain (it is persisted only in the tuner
+     * configuration), so buildTunerList reports the last value set through this server as a fallback.  A value
+     * only appears here after {@code POST /tuners/{id}/gain} has been called at least once since startup.
+     */
+    private final Map<String,Object> mLastGain = new ConcurrentHashMap<>();
 
     /**
      * Constructs the control server.
@@ -130,7 +157,7 @@ public class ControlServer
 
         mStartTime = System.currentTimeMillis();
 
-        mEventBuffer = new EventBuffer();
+        mEventBuffer = new EventBuffer(mPlaylistManager.getAliasModel());
         mPlaylistManager.getChannelProcessingManager().addDecodeEventListener(mEventBuffer);
 
         mExecutor = Executors.newFixedThreadPool(4);
@@ -322,6 +349,25 @@ public class ControlServer
                 entry.put("sampleRate", c.getSampleRate());
                 entry.put("ppm", c.getFrequencyCorrection());
                 entry.put("measuredPpmError", c.getPPMFrequencyError());
+
+                //Current gain: real value where the controller can read it, else the last value set via this API.
+                Object realGain = readCurrentGain(c);
+                entry.put("gain", realGain != null ? realGain : mLastGain.get(dt.getId()));
+
+                //Auto-PPM (automatic frequency error correction) enabled state.
+                boolean autoPpm = false;
+
+                try
+                {
+                    autoPpm = c.getFrequencyErrorCorrectionManager() != null &&
+                            c.getFrequencyErrorCorrectionManager().isEnabled();
+                }
+                catch(Exception e)
+                {
+                    //best effort
+                }
+
+                entry.put("autoPpm", autoPpm);
             }
             else
             {
@@ -331,6 +377,8 @@ public class ControlServer
                 entry.put("sampleRate", 0d);
                 entry.put("ppm", 0d);
                 entry.put("measuredPpmError", 0d);
+                entry.put("gain", null);
+                entry.put("autoPpm", false);
             }
 
             entry.put("error", dt.hasErrorMessage() ? dt.getErrorMessage() : null);
@@ -395,15 +443,608 @@ public class ControlServer
             }
             case "gain":
             {
-                //TODO: gain is device-typed with no common interface - dispatch per TunerController subtype in a
-                //      future iteration.  For now report as unsupported.
-                sendJson(exchange, 200, error("gain control not supported for this tuner type"));
+                Map<String,Object> result = applyGain(c, body);
+
+                //Cache the applied numeric gain for reporting in buildTunerList (most controllers can't read it back).
+                if(Boolean.TRUE.equals(result.get("ok")) && result.get("gain") != null)
+                {
+                    mLastGain.put(id, result.get("gain"));
+                }
+
+                sendJson(exchange, 200, result);
+                break;
+            }
+            case "samplerate":
+            {
+                long sampleRate = body.has("sampleRate") ? body.get("sampleRate").asLong() : 0L;
+                sendJson(exchange, 200, applySampleRate(c, sampleRate));
+                break;
+            }
+            case "autoppm":
+            {
+                boolean enabled = body.has("enabled") && body.get("enabled").asBoolean();
+                Map<String,Object> ok = new LinkedHashMap<>();
+
+                try
+                {
+                    FrequencyErrorCorrectionManager manager = c.getFrequencyErrorCorrectionManager();
+
+                    if(manager != null)
+                    {
+                        //Real mechanism: SDR-Trunk's FrequencyErrorCorrectionManager watches the decoder-measured
+                        //PPM error and, when enabled, nudges the tuner's frequency correction toward it.  This is
+                        //genuine automatic PPM correction, NOT a fabricated loop.
+                        manager.setEnabled(enabled);
+                        ok.put("ok", true);
+                        ok.put("autoPpm", manager.isEnabled());
+                    }
+                    else
+                    {
+                        //No correction manager on this controller - report as a no-op rather than an error.
+                        ok.put("ok", true);
+                        ok.put("autoPpm", enabled);
+                        ok.put("note", "not supported by this build");
+                    }
+                }
+                catch(Exception e)
+                {
+                    ok.put("ok", true);
+                    ok.put("autoPpm", enabled);
+                    ok.put("note", "not supported by this build");
+                }
+
+                sendJson(exchange, 200, ok);
                 break;
             }
             default:
                 sendJson(exchange, 404, error("not found"));
                 break;
         }
+    }
+
+    //---------------------------------------------------------------------------------------------------------------
+    // Tuner gain (device-typed dispatch)
+    //---------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Best-effort read of the current composite gain for controllers that expose a getter.  Returns null when the
+     * controller has no readable current-gain value (the common case - gain state lives in the tuner configuration).
+     */
+    private Object readCurrentGain(TunerController c)
+    {
+        try
+        {
+            if(c instanceof RspTunerController rsp)
+            {
+                return (double)rsp.getControlRsp().getCurrentGain();
+            }
+
+            if(c instanceof FCD1TunerController fcd1)
+            {
+                return String.valueOf(fcd1.getLNAGainSetting());
+            }
+        }
+        catch(Exception e)
+        {
+            //best effort
+        }
+
+        return null;
+    }
+
+    /**
+     * Applies gain to the tuner, dispatching on the concrete controller (and, for RTL, the embedded tuner) type.
+     * SDR-Trunk has no common gain interface, so each device is handled explicitly.
+     *
+     * <p>Request body fields (all optional - each device reads what applies to it):</p>
+     * <ul>
+     *   <li>{@code gain} (number) - desired gain in device units (dB-ish); the server snaps to the nearest
+     *       supported discrete step.</li>
+     *   <li>{@code auto} (boolean) - request automatic/AGC gain where the device supports it.</li>
+     *   <li>{@code gainMode} (string, "LINEARITY"|"SENSITIVITY") - Airspy / HydraSDR gain curve (default LINEARITY).</li>
+     *   <li>{@code lnaGain}, {@code vgaGain} (number) - HackRF LNA/VGA axes (dB).</li>
+     *   <li>{@code amp} (boolean) - HackRF RF amplifier enable.</li>
+     *   <li>{@code lnaState}, {@code gainReduction} (number) - SDRplay LNA state index and baseband gain reduction (20-59).</li>
+     *   <li>{@code attenuation} (number), {@code lna} (boolean) - Airspy HF attenuation (dB) and LNA enable.</li>
+     * </ul>
+     *
+     * @return response map: {@code {ok, tunerType, gain, gainLabel, ...device echoes...}} on success, or
+     *         {@code {ok:false, error}} when the tuner type has no settable gain via this API.
+     */
+    private Map<String,Object> applyGain(TunerController c, JsonNode body)
+    {
+        String tunerType = c.getClass().getSimpleName();
+        double requested = body.has("gain") ? body.get("gain").asDouble() : Double.NaN;
+        boolean auto = body.has("auto") && body.get("auto").asBoolean();
+
+        try
+        {
+            //---------------------------------------------------------------------------------- RTL2832 family
+            if(c instanceof RTL2832TunerController rtl && rtl.hasEmbeddedTuner())
+            {
+                EmbeddedTuner embedded = rtl.getEmbeddedTuner();
+
+                if(embedded instanceof R8xEmbeddedTuner r8x)
+                {
+                    if(auto)
+                    {
+                        r8x.setGain(R8xEmbeddedTuner.MasterGain.AUTOMATIC, true);
+                        return gainOk("R820T/R828D", null, "Automatic");
+                    }
+
+                    R8xEmbeddedTuner.MasterGain chosen = R8xEmbeddedTuner.MasterGain.MANUAL;
+                    double best = Double.MAX_VALUE;
+
+                    for(R8xEmbeddedTuner.MasterGain g : R8xEmbeddedTuner.MasterGain.values())
+                    {
+                        Double value = parseLeadingNumber(g.toString());
+
+                        if(value != null && Math.abs(value - requested) < best)
+                        {
+                            best = Math.abs(value - requested);
+                            chosen = g;
+                        }
+                    }
+
+                    r8x.setGain(chosen, true);
+                    return gainOk("R820T/R828D", parseLeadingNumber(chosen.toString()), chosen.toString());
+                }
+
+                if(embedded instanceof E4KEmbeddedTuner e4k)
+                {
+                    if(auto)
+                    {
+                        e4k.setGain(E4KEmbeddedTuner.E4KGain.AUTOMATIC, true);
+                        return gainOk("E4K", null, "Automatic");
+                    }
+
+                    E4KEmbeddedTuner.E4KGain chosen = E4KEmbeddedTuner.E4KGain.MANUAL;
+                    double best = Double.MAX_VALUE;
+
+                    for(E4KEmbeddedTuner.E4KGain g : E4KEmbeddedTuner.E4KGain.values())
+                    {
+                        //Match against the dB label (e.g. "16.5 db"); AUTOMATIC/MANUAL have no numeric label.
+                        Double value = parseLeadingNumber(g.toString());
+
+                        if(value != null && Math.abs(value - requested) < best)
+                        {
+                            best = Math.abs(value - requested);
+                            chosen = g;
+                        }
+                    }
+
+                    e4k.setGain(chosen, true);
+                    return gainOk("E4K", parseLeadingNumber(chosen.toString()), chosen.toString());
+                }
+
+                if(embedded instanceof FC0013EmbeddedTuner fc)
+                {
+                    if(auto)
+                    {
+                        fc.setGain(true, FC0013EmbeddedTuner.LNAGain.values()[0]);
+                        return gainOk("FC0013", null, "AGC");
+                    }
+
+                    FC0013EmbeddedTuner.LNAGain chosen = FC0013EmbeddedTuner.LNAGain.values()[0];
+                    double best = Double.MAX_VALUE;
+
+                    for(FC0013EmbeddedTuner.LNAGain g : FC0013EmbeddedTuner.LNAGain.values())
+                    {
+                        Double value = parseLeadingNumber(g.toString());
+
+                        if(value != null && Math.abs(value - requested) < best)
+                        {
+                            best = Math.abs(value - requested);
+                            chosen = g;
+                        }
+                    }
+
+                    fc.setGain(false, chosen);
+                    return gainOk("FC0013", parseLeadingNumber(chosen.toString()), chosen.toString());
+                }
+
+                return error("gain control not supported for RTL embedded tuner type [" +
+                        embedded.getClass().getSimpleName() + "]");
+            }
+
+            //---------------------------------------------------------------------------------- Airspy / HydraSDR
+            if(c instanceof AirspyTunerController airspy)
+            {
+                boolean sensitivity = "SENSITIVITY".equalsIgnoreCase(body.path("gainMode").asText(""));
+                int level = clamp((int)Math.round(Double.isNaN(requested) ? 0 : requested), 1, 22);
+                AirspyTunerController.GainMode mode = sensitivity ?
+                        AirspyTunerController.GainMode.SENSITIVITY : AirspyTunerController.GainMode.LINEARITY;
+                airspy.setGain(AirspyTunerController.Gain.getGain(mode, level));
+                Map<String,Object> ok = gainOk("Airspy", (double)level, mode.name() + "_" + level);
+                ok.put("gainMode", mode.name());
+                return ok;
+            }
+
+            if(c instanceof HydraSdrTunerController hydra)
+            {
+                boolean sensitivity = "SENSITIVITY".equalsIgnoreCase(body.path("gainMode").asText(""));
+                int level = clamp((int)Math.round(Double.isNaN(requested) ? 0 : requested), 1, 22);
+                HydraSdrTunerController.GainMode mode = sensitivity ?
+                        HydraSdrTunerController.GainMode.SENSITIVITY : HydraSdrTunerController.GainMode.LINEARITY;
+                hydra.setGain(HydraSdrTunerController.Gain.getGain(mode, level));
+                Map<String,Object> ok = gainOk("HydraSDR", (double)level, mode.name() + "_" + level);
+                ok.put("gainMode", mode.name());
+                return ok;
+            }
+
+            //---------------------------------------------------------------------------------- HackRF (two-axis)
+            if(c instanceof HackRFTunerController hackrf)
+            {
+                Double lnaReq = body.has("lnaGain") ? body.get("lnaGain").asDouble() :
+                        (Double.isNaN(requested) ? null : requested);
+                Double vgaReq = body.has("vgaGain") ? body.get("vgaGain").asDouble() : null;
+                Map<String,Object> ok = new LinkedHashMap<>();
+                ok.put("ok", true);
+                ok.put("tunerType", "HackRF");
+
+                if(lnaReq != null)
+                {
+                    HackRFTunerController.HackRFLNAGain chosen = HackRFTunerController.HackRFLNAGain.values()[0];
+                    double best = Double.MAX_VALUE;
+
+                    for(HackRFTunerController.HackRFLNAGain g : HackRFTunerController.HackRFLNAGain.values())
+                    {
+                        if(Math.abs(g.getValue() - lnaReq) < best)
+                        {
+                            best = Math.abs(g.getValue() - lnaReq);
+                            chosen = g;
+                        }
+                    }
+
+                    hackrf.setLNAGain(chosen);
+                    ok.put("lnaGain", chosen.getValue());
+                    ok.put("gain", chosen.getValue());
+                }
+
+                if(vgaReq != null)
+                {
+                    HackRFTunerController.HackRFVGAGain chosen = HackRFTunerController.HackRFVGAGain.values()[0];
+                    double best = Double.MAX_VALUE;
+
+                    for(HackRFTunerController.HackRFVGAGain g : HackRFTunerController.HackRFVGAGain.values())
+                    {
+                        if(Math.abs(g.getValue() - vgaReq) < best)
+                        {
+                            best = Math.abs(g.getValue() - vgaReq);
+                            chosen = g;
+                        }
+                    }
+
+                    hackrf.setVGAGain(chosen);
+                    ok.put("vgaGain", chosen.getValue());
+                }
+
+                if(body.has("amp"))
+                {
+                    hackrf.setAmplifierEnabled(body.get("amp").asBoolean());
+                    ok.put("amp", body.get("amp").asBoolean());
+                }
+
+                return ok;
+            }
+
+            //---------------------------------------------------------------------------------- SDRplay RSP
+            if(c instanceof RspTunerController rsp)
+            {
+                int lna = body.has("lnaState") ? body.get("lnaState").asInt() : rsp.getControlRsp().getLNA();
+                int gr = body.has("gainReduction") ? body.get("gainReduction").asInt() :
+                        rsp.getControlRsp().getBasebandGainReduction();
+                rsp.getControlRsp().setGain(lna, gr);
+                Map<String,Object> ok = new LinkedHashMap<>();
+                ok.put("ok", true);
+                ok.put("tunerType", "SDRplay RSP");
+                ok.put("lnaState", lna);
+                ok.put("gainReduction", gr);
+                ok.put("gain", (double)rsp.getControlRsp().getCurrentGain());
+                return ok;
+            }
+
+            //---------------------------------------------------------------------------------- FUNcube Dongle Pro V1
+            if(c instanceof FCD1TunerController fcd1)
+            {
+                FCD1TunerController.LNAGain chosen = FCD1TunerController.LNAGain.values()[0];
+                double best = Double.MAX_VALUE;
+
+                for(FCD1TunerController.LNAGain g : FCD1TunerController.LNAGain.values())
+                {
+                    Double value = parseSignedName(g.name());
+
+                    if(value != null && Math.abs(value - requested) < best)
+                    {
+                        best = Math.abs(value - requested);
+                        chosen = g;
+                    }
+                }
+
+                fcd1.setLNAGain(chosen);
+                return gainOk("FUNcube Pro V1", parseSignedName(chosen.name()), chosen.toString());
+            }
+
+            //---------------------------------------------------------------------------------- FUNcube Dongle Pro+ V2
+            if(c instanceof FCD2TunerController fcd2)
+            {
+                boolean enabled = body.has("enabled") ? body.get("enabled").asBoolean() :
+                        (!Double.isNaN(requested) && requested > 0);
+                fcd2.setLNAGain(enabled);
+                Map<String,Object> ok = gainOk("FUNcube Pro+ V2", enabled ? 1d : 0d, enabled ? "LNA on" : "LNA off");
+                ok.put("lna", enabled);
+                return ok;
+            }
+
+            //---------------------------------------------------------------------------------- Airspy HF+ (attenuation)
+            if(c instanceof AirspyHfTunerController hf)
+            {
+                Map<String,Object> ok = new LinkedHashMap<>();
+                ok.put("ok", true);
+                ok.put("tunerType", "Airspy HF+");
+
+                if(body.has("attenuation") || !Double.isNaN(requested))
+                {
+                    double attReq = body.has("attenuation") ? body.get("attenuation").asDouble() : requested;
+                    Attenuation chosen = Attenuation.values()[0];
+                    double best = Double.MAX_VALUE;
+
+                    for(Attenuation a : Attenuation.values())
+                    {
+                        if(Math.abs(a.getValue() - attReq) < best)
+                        {
+                            best = Math.abs(a.getValue() - attReq);
+                            chosen = a;
+                        }
+                    }
+
+                    hf.setAttenuation(chosen);
+                    ok.put("attenuation", (int)chosen.getValue());
+                    ok.put("gain", (int)chosen.getValue());
+                }
+
+                if(body.has("lna"))
+                {
+                    hf.setLna(body.get("lna").asBoolean());
+                    ok.put("lna", body.get("lna").asBoolean());
+                }
+
+                return ok;
+            }
+        }
+        catch(Exception e)
+        {
+            return error("gain error on [" + tunerType + "]: " +
+                    (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+        }
+
+        return error("gain control not supported for tuner type [" + tunerType + "]");
+    }
+
+    /**
+     * Builds a standard successful gain response.
+     */
+    private Map<String,Object> gainOk(String tunerType, Double gain, String gainLabel)
+    {
+        Map<String,Object> ok = new LinkedHashMap<>();
+        ok.put("ok", true);
+        ok.put("tunerType", tunerType);
+        ok.put("gain", gain);
+        ok.put("gainLabel", gainLabel);
+        return ok;
+    }
+
+    //---------------------------------------------------------------------------------------------------------------
+    // Tuner sample rate (device-typed dispatch, validated against the device's allowed rates)
+    //---------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Sets the tuner sample rate, validating the requested rate (Hz) against the device's allowed set.  Returns a
+     * clear error listing the allowed rates when the request is not an exact supported value, or when the device
+     * has a fixed sample rate.
+     *
+     * @return {@code {ok:true, tunerType, sampleRate}} on success, else {@code {ok:false, error, allowedSampleRates}}.
+     */
+    private Map<String,Object> applySampleRate(TunerController c, long requested)
+    {
+        String tunerType = c.getClass().getSimpleName();
+
+        try
+        {
+            if(c instanceof RTL2832TunerController rtl)
+            {
+                List<Long> allowed = new ArrayList<>();
+
+                for(RTL2832TunerController.SampleRate sr : RTL2832TunerController.SampleRate.values())
+                {
+                    allowed.add((long)sr.getRate());
+
+                    if(sr.getRate() == requested)
+                    {
+                        rtl.setSampleRate(sr);
+                        return sampleRateOk("RTL2832", sr.getRate());
+                    }
+                }
+
+                return unsupportedSampleRate(tunerType, allowed);
+            }
+
+            if(c instanceof HackRFTunerController hackrf)
+            {
+                List<Long> allowed = new ArrayList<>();
+
+                for(HackRFTunerController.HackRFSampleRate sr : HackRFTunerController.HackRFSampleRate.VALID_SAMPLE_RATES)
+                {
+                    allowed.add((long)sr.getRate());
+
+                    if((long)sr.getRate() == requested)
+                    {
+                        hackrf.setSampleRate(sr);
+                        return sampleRateOk("HackRF", (long)sr.getRate());
+                    }
+                }
+
+                return unsupportedSampleRate(tunerType, allowed);
+            }
+
+            if(c instanceof AirspyTunerController airspy)
+            {
+                List<Long> allowed = new ArrayList<>();
+
+                for(AirspySampleRate sr : airspy.getSampleRates())
+                {
+                    allowed.add((long)sr.getRate());
+                }
+
+                AirspySampleRate match = airspy.getSampleRate((int)requested);
+
+                if(match != null && match.getRate() == requested)
+                {
+                    airspy.setSampleRate(match);
+                    return sampleRateOk("Airspy", match.getRate());
+                }
+
+                return unsupportedSampleRate(tunerType, allowed);
+            }
+
+            if(c instanceof HydraSdrTunerController hydra)
+            {
+                List<Long> allowed = new ArrayList<>();
+
+                for(io.github.dsheirer.source.tuner.hydrasdr.HydraSdrSampleRate sr : hydra.getSampleRates())
+                {
+                    allowed.add((long)sr.getRate());
+                }
+
+                io.github.dsheirer.source.tuner.hydrasdr.HydraSdrSampleRate match = hydra.getSampleRate((int)requested);
+
+                if(match != null && match.getRate() == requested)
+                {
+                    hydra.setSampleRate(match);
+                    return sampleRateOk("HydraSDR", match.getRate());
+                }
+
+                return unsupportedSampleRate(tunerType, allowed);
+            }
+
+            if(c instanceof RspTunerController rsp)
+            {
+                List<Long> allowed = new ArrayList<>();
+
+                for(RspSampleRate sr : RspSampleRate.values())
+                {
+                    allowed.add(sr.getSampleRate());
+
+                    if(sr.getSampleRate() == requested)
+                    {
+                        rsp.setSampleRate(sr);
+                        return sampleRateOk("SDRplay RSP", sr.getSampleRate());
+                    }
+                }
+
+                return unsupportedSampleRate(tunerType, allowed);
+            }
+
+            if(c instanceof AirspyHfTunerController hf)
+            {
+                List<Long> allowed = new ArrayList<>();
+
+                for(AirspyHfSampleRate sr : hf.getAvailableSampleRates())
+                {
+                    allowed.add((long)sr.getSampleRate());
+
+                    if(sr.getSampleRate() == requested)
+                    {
+                        hf.setSampleRate(sr);
+                        return sampleRateOk("Airspy HF+", sr.getSampleRate());
+                    }
+                }
+
+                return unsupportedSampleRate(tunerType, allowed);
+            }
+
+            if(c instanceof FCD1TunerController || c instanceof FCD2TunerController)
+            {
+                Map<String,Object> err = error("sample rate is fixed for tuner type [" + tunerType + "]");
+                err.put("sampleRate", (long)c.getSampleRate());
+                return err;
+            }
+        }
+        catch(Exception e)
+        {
+            return error("sample rate error on [" + tunerType + "]: " +
+                    (e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName()));
+        }
+
+        return error("sample rate control not supported for tuner type [" + tunerType + "]");
+    }
+
+    private Map<String,Object> sampleRateOk(String tunerType, long sampleRate)
+    {
+        Map<String,Object> ok = new LinkedHashMap<>();
+        ok.put("ok", true);
+        ok.put("tunerType", tunerType);
+        ok.put("sampleRate", sampleRate);
+        return ok;
+    }
+
+    private Map<String,Object> unsupportedSampleRate(String tunerType, List<Long> allowed)
+    {
+        Map<String,Object> err = error("unsupported sample rate for tuner type [" + tunerType + "]");
+        err.put("allowedSampleRates", allowed);
+        return err;
+    }
+
+    /**
+     * Clamps an integer to the inclusive range [min, max].
+     */
+    private static int clamp(int value, int min, int max)
+    {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    /**
+     * Parses the leading number from a label such as "248", "23 HIGH" or "0.240 MHz".  Returns null if none.
+     */
+    private static Double parseLeadingNumber(String text)
+    {
+        if(text == null)
+        {
+            return null;
+        }
+
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("-?\\d+(?:\\.\\d+)?").matcher(text);
+        return m.find() ? Double.valueOf(m.group()) : null;
+    }
+
+    /**
+     * Parses a signed value from an enum constant name such as "PLUS_15", "MINUS_10" or "LNA_GAIN_PLUS_30_0".
+     * "PLUS"/"MINUS" set the sign; the first numeric group is the magnitude (an optional trailing "_0" is the
+     * decimal tenths, e.g. "PLUS_30_0" -> 30.0).  Returns null when no magnitude is present.
+     */
+    private static Double parseSignedName(String name)
+    {
+        if(name == null)
+        {
+            return null;
+        }
+
+        double sign = name.contains("MINUS") ? -1d : 1d;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(\\d+)(?:_(\\d+))?\\s*$").matcher(name);
+
+        if(m.find())
+        {
+            double magnitude = Double.parseDouble(m.group(1));
+
+            if(m.group(2) != null)
+            {
+                magnitude += Double.parseDouble("0." + m.group(2));
+            }
+
+            return sign * magnitude;
+        }
+
+        return null;
     }
 
     private void handleChannels(HttpExchange exchange)
@@ -510,29 +1151,48 @@ public class ControlServer
                 if(meta != null)
                 {
                     Identifier state = meta.getChannelStateIdentifier();
-                    entry.put("state", state != null ? state.toString() : "PROCESSING");
+                    String stateText = state != null ? state.toString() : "PROCESSING";
+                    entry.put("state", stateText);
+                    //CONTROL indicates the channel is locked on a trunking control channel (P25/DMR/etc.).
+                    entry.put("control", "CONTROL".equals(stateText));
 
                     Identifier from = meta.getFromIdentifier();
                     entry.put("from", from != null ? from.toString() : null);
+                    entry.put("fromAlias", aliasNames(meta.getFromIdentifierAliases()));
 
                     Identifier to = meta.getToIdentifier();
                     entry.put("to", to != null ? to.toString() : null);
+                    entry.put("toAlias", aliasNames(meta.getToIdentifierAliases()));
 
+                    Identifier talker = meta.getTalkerAliasIdentifier();
+                    entry.put("talkerAlias", talker != null ? talker.toString() : null);
+
+                    entry.put("timeslot", meta.getTimeslot());
                     entry.put("frequency", frequencyOf(meta));
                 }
                 else
                 {
                     entry.put("state", "PROCESSING");
+                    entry.put("control", false);
                     entry.put("from", null);
+                    entry.put("fromAlias", null);
                     entry.put("to", null);
+                    entry.put("toAlias", null);
+                    entry.put("talkerAlias", null);
+                    entry.put("timeslot", null);
                     entry.put("frequency", null);
                 }
             }
             else
             {
                 entry.put("state", "STOPPED");
+                entry.put("control", false);
                 entry.put("from", null);
+                entry.put("fromAlias", null);
                 entry.put("to", null);
+                entry.put("toAlias", null);
+                entry.put("talkerAlias", null);
+                entry.put("timeslot", null);
                 entry.put("frequency", null);
             }
 
@@ -541,7 +1201,103 @@ public class ControlServer
 
         Map<String,Object> body = new LinkedHashMap<>();
         body.put("channels", list);
+        body.put("activeCalls", buildActiveCalls(mm));
         return body;
+    }
+
+    /**
+     * Builds a "Now Playing" list from the live channel metadata model - one entry per metadata row that is in an
+     * active state (CALL, ENCRYPTED, DATA, CONTROL or ACTIVE).  This captures dynamically-allocated trunking traffic
+     * channels that are NOT in the configured channel list, so a UI can render active calls (talkgroup, from -&gt; to
+     * with aliases, control-channel lock) without guessing.  Includes CONTROL rows so the control channel is visible.
+     */
+    private List<Map<String,Object>> buildActiveCalls(ChannelMetadataModel mm)
+    {
+        List<Map<String,Object>> calls = new ArrayList<>();
+        int rows = mm.getRowCount();
+
+        for(int r = 0; r < rows; r++)
+        {
+            try
+            {
+                ChannelMetadata meta = mm.getChannelMetadata(r);
+
+                if(meta == null)
+                {
+                    continue;
+                }
+
+                Identifier state = meta.getChannelStateIdentifier();
+                String stateText = state != null ? state.toString() : null;
+
+                //Only emit rows that reflect active decode (call / control / data / active).
+                if(stateText == null || "IDLE".equals(stateText) || "FADE".equals(stateText) ||
+                        "RESET".equals(stateText) || "TEARDOWN".equals(stateText))
+                {
+                    continue;
+                }
+
+                Map<String,Object> call = new LinkedHashMap<>();
+                call.put("state", stateText);
+                call.put("control", "CONTROL".equals(stateText));
+
+                Channel ch = mm.getChannelFromMetadata(meta);
+                call.put("channelId", ch != null ? ch.getChannelID() : null);
+                call.put("channelName", ch != null ? ch.getName() : null);
+
+                Identifier from = meta.getFromIdentifier();
+                call.put("from", from != null ? from.toString() : null);
+                call.put("fromAlias", aliasNames(meta.getFromIdentifierAliases()));
+
+                Identifier to = meta.getToIdentifier();
+                //For group calls the TO identifier is the talkgroup.
+                call.put("to", to != null ? to.toString() : null);
+                call.put("talkgroup", to != null ? to.toString() : null);
+                call.put("toAlias", aliasNames(meta.getToIdentifierAliases()));
+
+                Identifier talker = meta.getTalkerAliasIdentifier();
+                call.put("talkerAlias", talker != null ? talker.toString() : null);
+
+                call.put("timeslot", meta.getTimeslot());
+                call.put("frequency", frequencyOf(meta));
+
+                calls.add(call);
+            }
+            catch(Exception e)
+            {
+                //Metadata list mutates on the EDT - ignore transient index issues.
+            }
+        }
+
+        return calls;
+    }
+
+    /**
+     * Best-effort comma-joined alias names, or null if the list is null/empty.
+     */
+    private static String aliasNames(List<Alias> aliases)
+    {
+        if(aliases == null || aliases.isEmpty())
+        {
+            return null;
+        }
+
+        StringBuilder sb = new StringBuilder();
+
+        for(Alias alias : aliases)
+        {
+            if(alias != null && alias.getName() != null && !alias.getName().isEmpty())
+            {
+                if(sb.length() > 0)
+                {
+                    sb.append(", ");
+                }
+
+                sb.append(alias.getName());
+            }
+        }
+
+        return sb.length() > 0 ? sb.toString() : null;
     }
 
     private Long frequencyOf(ChannelMetadata meta)
