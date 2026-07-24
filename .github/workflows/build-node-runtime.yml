@@ -34,7 +34,12 @@ jobs:
             jdk_url: https://download.bell-sw.com/java/25.0.1+11/bellsoft-jdk25.0.1+11-windows-amd64-full.zip
     runs-on: ${{ matrix.os }}
     steps:
+      # The control-server code lives on feature/node-control, but release/
+      # dispatch triggers run the workflow from the default branch — so always
+      # build the feature branch explicitly. Update this when it's merged.
       - uses: actions/checkout@v4
+        with:
+          ref: feature/node-control
 
       - name: Install Liberica full JDK 25 (Linux)
         if: runner.os == 'Linux'
