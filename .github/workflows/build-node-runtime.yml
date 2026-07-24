@@ -1,0 +1,83 @@
+name: Build node runtime
+
+# Builds the headless SDR-Trunk jlink runtime (the fork's control-server build)
+# for the feeder-node agent, and attaches it to a GitHub Release. The feeder
+# node-versions.json manifest points at these assets.
+#
+# Triggers:
+#   - release: published  -> attaches the runtime to that release
+#   - workflow_dispatch    -> builds + attaches to a rolling "node-runtime" release
+#
+# Uses the BellSoft Liberica "full" JDK 25 (bundles JavaFX), the same JDK the
+# build expects (see build.gradle), both as the compile toolchain and as the
+# runtime the jlink image bundles.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: sdrtrunk-linux-amd64.zip
+            jdk_url: https://download.bell-sw.com/java/25.0.1+11/bellsoft-jdk25.0.1+11-linux-amd64-full.tar.gz
+          - os: windows-latest
+            asset: sdrtrunk-windows-amd64.zip
+            jdk_url: https://download.bell-sw.com/java/25.0.1+11/bellsoft-jdk25.0.1+11-windows-amd64-full.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Liberica full JDK 25 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL "${{ matrix.jdk_url }}" -o jdk.tar.gz
+          mkdir -p "$HOME/jdk"
+          tar -xzf jdk.tar.gz -C "$HOME/jdk" --strip-components=1
+          echo "JAVA_HOME=$HOME/jdk" >> "$GITHUB_ENV"
+          echo "$HOME/jdk/bin" >> "$GITHUB_PATH"
+
+      - name: Install Liberica full JDK 25 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          curl.exe -fsSL "${{ matrix.jdk_url }}" -o jdk.zip
+          Expand-Archive jdk.zip -DestinationPath "$env:USERPROFILE\jdk-x"
+          $root = (Get-ChildItem "$env:USERPROFILE\jdk-x" -Directory | Select-Object -First 1).FullName
+          "JAVA_HOME=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$root\bin"       | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Build runtime (current OS)
+        run: ./gradlew runtimeZipCurrent -Porg.gradle.java.installations.paths="${{ env.JAVA_HOME }}" --no-daemon --stacktrace
+
+      - name: Package + hash (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cp build/image/sdr-trunk.zip "${{ matrix.asset }}"
+          sha256sum "${{ matrix.asset }}" | tee "${{ matrix.asset }}.sha256"
+
+      - name: Package + hash (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item build/image/sdr-trunk.zip "${{ matrix.asset }}"
+          $h = (Get-FileHash "${{ matrix.asset }}" -Algorithm SHA256).Hash.ToLower()
+          "$h  ${{ matrix.asset }}" | Out-File -Encoding ascii "${{ matrix.asset }}.sha256"
+          Write-Host $h
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || 'node-runtime' }}
+          name: ${{ github.event.release.name || 'Node runtime (rolling)' }}
+          files: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
