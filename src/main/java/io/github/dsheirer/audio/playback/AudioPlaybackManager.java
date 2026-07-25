@@ -114,6 +114,25 @@ public class AudioPlaybackManager implements Listener<AudioSegment>, IAudioContr
      */
     private void processAudioSegments()
     {
+        //Headless / no audio output device: there is nothing to play audio through
+        //(mAudioOutput is null), so releasing + draining both queues here avoids a
+        //NullPointerException on every 250ms pass (which otherwise floods the log).
+        //Audio streaming + recording are separate consumers and are unaffected.
+        if(mAudioOutput == null)
+        {
+            AudioSegment segment;
+            while((segment = mNewAudioSegmentQueue.poll()) != null)
+            {
+                segment.decrementConsumerCount();
+            }
+            for(AudioSegment pending: mAudioSegments)
+            {
+                pending.decrementConsumerCount();
+            }
+            mAudioSegments.clear();
+            return;
+        }
+
         //Process new audio segments queue.  If segment has audio, queue it for replay, otherwise place in pending queue
         AudioSegment newSegment = mNewAudioSegmentQueue.poll();
 
