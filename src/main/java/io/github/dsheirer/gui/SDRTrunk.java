@@ -326,6 +326,13 @@ public class SDRTrunk implements Listener<TunerEvent>
         {
             if(GraphicsEnvironment.isHeadless())
             {
+                //HARD GATE: never start decoding until BOTH the CPU calibration and
+                //the JMBE voice codec are ready. Decoding without JMBE yields calls
+                //with no audio (nothing to stream); running uncalibrated wastes CPU.
+                if(!isReadyToDecodeHeadless())
+                {
+                    return;
+                }
                 for(Channel channel: channels)
                 {
                     try
@@ -447,36 +454,70 @@ public class SDRTrunk implements Listener<TunerEvent>
     }
 
     /**
+     * True only when BOTH the CPU calibration and the JMBE voice codec are ready.
+     * Channels must not decode until this holds (no JMBE -> calls with no audio).
+     */
+    private boolean isReadyToDecodeHeadless()
+    {
+        boolean calibrated = CalibrationManager.getInstance().isCalibrated();
+        Path jmbe = mUserPreferences.getJmbeLibraryPreference().getPathJmbeLibrary();
+        boolean jmbeOk = jmbe != null && Files.exists(jmbe);
+        if(!calibrated || !jmbeOk)
+        {
+            mLog.error("headless: NOT auto-starting channels — calibrated=" + calibrated + " jmbeInstalled=" + jmbeOk +
+                    ". Decoding without the JMBE codec produces no voice audio; channels will start once both are ready.");
+            return false;
+        }
+        return true;
+    }
+
+    /**
      * After a genuine first-run setup (calibration and/or JMBE install), restart
      * SDR-Trunk so channels come up with the calibration + JMBE applied (both are
-     * read at startup). A marker file in the (writable) app root bounds this to a
-     * SINGLE restart, so even if the persisted "calibrated" flag / JMBE path fail
-     * to save (e.g. HOME not writable) this can never loop.
+     * read at startup). A restart COUNTER in the (writable) app root bounds this
+     * to a few restarts — enough for calibration then a (possibly retried) JMBE
+     * install to each settle, but capped so it can never loop even if the persisted
+     * "calibrated" flag / JMBE path fail to save (e.g. HOME not writable).
      */
     private void maybeRestartAfterFirstRunSetup()
     {
-        Path marker = mUserPreferences.getDirectoryPreference().getDirectoryApplicationRoot()
-                .resolve(".headless-setup-restarted");
+        final int MAX_RESTARTS = 3;
+        Path counter = mUserPreferences.getDirectoryPreference().getDirectoryApplicationRoot()
+                .resolve(".headless-setup-restarts");
 
-        if(Files.exists(marker))
+        int count = 0;
+        try
         {
-            mLog.warn("headless: first-run setup ran again but the restart marker is present - NOT restarting " +
-                    "(avoiding a loop). Calibration/JMBE prefs are not persisting; ensure HOME is writable.");
+            if(Files.exists(counter))
+            {
+                count = Integer.parseInt(Files.readString(counter).trim());
+            }
+        }
+        catch(Exception ignore)
+        {
+            count = 0;
+        }
+
+        if(count >= MAX_RESTARTS)
+        {
+            mLog.warn("headless: first-run setup did work again but already restarted " + count + " times - NOT " +
+                    "restarting (avoiding a loop). Calibration/JMBE prefs may not be persisting; ensure HOME is writable.");
             return;
         }
 
         try
         {
-            Files.writeString(marker, "restarted once after first-run calibration/JMBE setup\n");
+            Files.writeString(counter, Integer.toString(count + 1));
         }
         catch(Exception e)
         {
-            mLog.error("headless: could not write restart marker; NOT restarting (avoiding a possible loop)", e);
+            mLog.error("headless: could not write restart counter; NOT restarting (avoiding a possible loop)", e);
             return;
         }
 
-        mLog.info("headless: first-run setup complete - restarting SDR-Trunk so channels start with calibration + JMBE applied");
-        System.exit(0); //the node supervisor relaunches; the second run skips setup and auto-starts channels
+        mLog.info("headless: first-run setup did work - restarting SDR-Trunk (restart " + (count + 1) + " of " +
+                MAX_RESTARTS + ") so channels start with calibration + JMBE applied");
+        System.exit(0); //the node supervisor relaunches; a subsequent clean run auto-starts channels
     }
 
     /**
@@ -790,7 +831,7 @@ public class SDRTrunk implements Listener<TunerEvent>
         {
             int port = Integer.parseInt(portProperty.trim());
             String token = System.getenv("SDRTRUNK_CONTROL_TOKEN");
-            mControlServer = new ControlServer(mTunerManager, mPlaylistManager, mDiagnosticMonitor, headless, port, token);
+            mControlServer = new ControlServer(mTunerManager, mPlaylistManager, mDiagnosticMonitor, mUserPreferences, headless, port, token);
             mControlServer.start();
             mLog.info("Headless control server started on port [" + port + "]");
         }

@@ -118,15 +118,19 @@ public class ControlServer
      * @param token bearer token from env SDRTRUNK_CONTROL_TOKEN.
      */
     public ControlServer(TunerManager tunerManager, PlaylistManager playlistManager, DiagnosticMonitor diagnosticMonitor,
+                         io.github.dsheirer.preference.UserPreferences userPreferences,
                          boolean headless, int port, String token)
     {
         mTunerManager = tunerManager;
         mPlaylistManager = playlistManager;
         mDiagnosticMonitor = diagnosticMonitor;
+        mUserPreferences = userPreferences;
         mHeadless = headless;
         mPort = port;
         mToken = token;
     }
+
+    private final io.github.dsheirer.preference.UserPreferences mUserPreferences;
 
     /**
      * Object mapper shared with the WebSocket server.
@@ -273,6 +277,15 @@ public class ControlServer
             body.put("cores", runtime.availableProcessors());
             body.put("memUsedMB", usedMB);
             body.put("memMaxMB", maxMB);
+
+            // Node readiness: CPU calibration + the JMBE (AMBE/IMBE) voice codec.
+            // Both must be present before channels decode voice with audio.
+            boolean calibrated = io.github.dsheirer.vector.calibrate.CalibrationManager.getInstance().isCalibrated();
+            java.nio.file.Path jmbePath = mUserPreferences != null
+                    ? mUserPreferences.getJmbeLibraryPreference().getPathJmbeLibrary() : null;
+            boolean jmbeInstalled = jmbePath != null && java.nio.file.Files.exists(jmbePath);
+            body.put("calibrated", calibrated);
+            body.put("jmbeInstalled", jmbeInstalled);
 
             sendJson(exchange, 200, body);
         }
