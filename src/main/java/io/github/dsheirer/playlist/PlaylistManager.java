@@ -42,6 +42,7 @@ import io.github.dsheirer.sample.Listener;
 import io.github.dsheirer.service.radioreference.RadioReference;
 import io.github.dsheirer.source.tuner.manager.TunerManager;
 import io.github.dsheirer.util.ThreadPool;
+import java.awt.GraphicsEnvironment;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -440,6 +441,17 @@ public class PlaylistManager implements Listener<ChannelEvent>
      */
     private void save()
     {
+        // Headless = a feeder node, where the node agent is the SOLE author of the
+        // playlist file (it renders + writes default.xml, then reloads it). If
+        // SDR-Trunk ever wrote the playlist back, its in-memory state would clobber
+        // the agent's edits — most visibly re-enabling (enabled="true") a channel
+        // the operator just disabled, which then auto-starts on the next restart.
+        // Never persist the playlist here in headless mode; the agent owns it.
+        if(GraphicsEnvironment.isHeadless())
+        {
+            return;
+        }
+
         PlaylistPreference playlistPreference = mUserPreferences.getPlaylistPreference();
 
         PlaylistV2 playlist = new PlaylistV2();
