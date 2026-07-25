@@ -27,11 +27,17 @@
     </encoder>
   </appender>
           
-  <root level="DEBUG">
+  <root level="INFO">
     <appender-ref ref="STDOUT" />
   </root>
 
   <!-- Apache Mina TCP/HTTP library -->
   <logger name="org.apache.mina" level="INFO" />
+
+  <!-- Node control WebSocket library (org.java-websocket): at DEBUG/TRACE it logs
+       EVERY frame it sends. The spectrum streamer pushes many binary frames/sec to
+       the staff panel, so this floods the log and thrashes the JVM heap. Pin it to
+       WARN so real RdioScanner / broadcast / decode lines stay visible. -->
+  <logger name="org.java_websocket" level="WARN" />
 
 </configuration>

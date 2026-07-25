@@ -203,6 +203,21 @@ public class AudioStreamingManager implements Listener<AudioSegment>
                         processAudioSegment(audioSegment, identifiers, audioSegment.getBroadcastChannels());
                     }
                 }
+                else if(mAudioRecordingListener != null &&
+                        audioSegment.getIdentifierCollection().getToIdentifier() != null)
+                {
+                    //Node diagnostic: a completed voice call (has a TO talkgroup) is being DROPPED
+                    //here — it is NOT streamed to rdio because the segment accumulated no broadcast
+                    //channels (hasBroadcastChannels() == false). Log the alias-list state + the
+                    //identifiers so we can tell whether the alias list failed to attach to the
+                    //segment (e.g. a dynamically-allocated traffic channel not inheriting the control
+                    //channel's alias list) versus the talkgroup simply not matching an alias that
+                    //carries a broadcastChannel.
+                    mLog.info("Node diag: call NOT streamed (no broadcast channels) - aliasList=" +
+                            (audioSegment.getAliasList() != null ? "present" : "NULL") +
+                            " to=" + audioSegment.getIdentifierCollection().getToIdentifier() +
+                            " identifiers=" + audioSegment.getIdentifierCollection().getIdentifiers());
+                }
 
                 audioSegment.decrementConsumerCount();
             }
