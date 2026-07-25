@@ -70,21 +70,43 @@ public class SpectrumStreamer implements DFTResultsListener
         mConnection = connection;
     }
 
+    /** Smallest DFT size we will honor (DFTSize has no 256-point size, so this is the floor). */
+    private static final int MIN_BINS = 512;
+    /** Largest DFT size we will honor for a control-server spectrum subscription. */
+    private static final int MAX_BINS = 4096;
+    /** Default DFT size when the client does not request a specific bin count (or requests <= 0). */
+    private static final int DEFAULT_BINS = 1024;
+
     /**
-     * Maps a requested bin count to the nearest supported DFT size (512 / 1024 / 2048).
+     * Maps a requested bin count to a supported {@link DFTSize}.  The requested value is clamped to the
+     * [{@value #MIN_BINS}, {@value #MAX_BINS}] power-of-two range (defaulting to {@value #DEFAULT_BINS} when
+     * unspecified) and then rounded UP to the nearest supported DFT size (512 / 1024 / 2048 / 4096) so the
+     * emitted {@code binCount} is at least the requested resolution.  Because the emitted frame carries the
+     * actual {@code binCount}, the client always learns the true size that was used.
      */
     public static DFTSize mapSize(int bins)
     {
-        if(bins <= 768)
+        if(bins <= 0)
+        {
+            bins = DEFAULT_BINS;
+        }
+
+        bins = Math.max(MIN_BINS, Math.min(MAX_BINS, bins));
+
+        if(bins <= 512)
         {
             return DFTSize.FFT00512;
         }
-        else if(bins <= 1536)
+        else if(bins <= 1024)
         {
             return DFTSize.FFT01024;
         }
+        else if(bins <= 2048)
+        {
+            return DFTSize.FFT02048;
+        }
 
-        return DFTSize.FFT02048;
+        return DFTSize.FFT04096;
     }
 
     /**

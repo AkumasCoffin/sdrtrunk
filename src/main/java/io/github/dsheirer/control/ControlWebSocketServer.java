@@ -176,7 +176,7 @@ public class ControlWebSocketServer extends WebSocketServer
         }
 
         int fps = node.has("fps") ? node.get("fps").asInt(10) : 10;
-        int bins = node.has("bins") ? node.get("bins").asInt(512) : 512;
+        int bins = node.has("bins") ? node.get("bins").asInt(1024) : 1024;
 
         DiscoveredTunerModel model = mControlServer.getTunerManager().getDiscoveredTunerModel();
         DiscoveredTuner discoveredTuner = model.getDiscoveredTuner(tunerId);

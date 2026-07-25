@@ -368,6 +368,9 @@ public class ControlServer
                 }
 
                 entry.put("autoPpm", autoPpm);
+
+                //Per-device capabilities so the UI can build correct controls without hardcoding per-type.
+                entry.put("capabilities", buildTunerCapabilities(c));
             }
             else
             {
@@ -379,6 +382,7 @@ public class ControlServer
                 entry.put("measuredPpmError", 0d);
                 entry.put("gain", null);
                 entry.put("autoPpm", false);
+                entry.put("capabilities", null);
             }
 
             entry.put("error", dt.hasErrorMessage() ? dt.getErrorMessage() : null);
@@ -388,6 +392,325 @@ public class ControlServer
         Map<String,Object> body = new LinkedHashMap<>();
         body.put("tuners", list);
         return body;
+    }
+
+    //---------------------------------------------------------------------------------------------------------------
+    // Per-tuner capabilities (device-typed dispatch, mirrors applyGain / applySampleRate)
+    //---------------------------------------------------------------------------------------------------------------
+
+    /**
+     * Builds a best-effort {@code capabilities} object for a specific tuner controller describing what it can be
+     * set to, so the UI can render correct controls instead of hardcoding per device type.  Dispatches on the
+     * concrete controller (and, for RTL, the embedded tuner) type - the same dispatch used by {@link #applyGain}
+     * and {@link #applySampleRate}.  Each axis is populated only when the device actually has it; anything the
+     * controller does not cleanly expose is simply omitted.
+     *
+     * <p>Top-level fields:</p>
+     * <ul>
+     *   <li>{@code sampleRates} - array of settable sample rates in Hz (omitted/empty for fixed-rate devices).</li>
+     *   <li>{@code gain} - object describing the device's gain model (see below).</li>
+     * </ul>
+     *
+     * <p>The {@code gain.mode} is one of {@code "master"} (single composite axis), {@code "multi"} (independent
+     * axes such as LNA + VGA), {@code "toggle"} (a single boolean) or {@code "fixed"}.  For the RTL master gain
+     * the {@code masterGainUnit} field disambiguates whether the {@code /gain} endpoint's {@code gain} number is
+     * a raw device value, a dB figure, or a 0-based step index - the value is always snapped to the nearest entry
+     * in the {@code masterGain} list.</p>
+     */
+    private Map<String,Object> buildTunerCapabilities(TunerController c)
+    {
+        Map<String,Object> caps = new LinkedHashMap<>();
+
+        try
+        {
+            caps.put("sampleRates", buildSampleRates(c));
+        }
+        catch(Exception e)
+        {
+            //best effort - omit on failure
+        }
+
+        try
+        {
+            Map<String,Object> gain = buildGainCapabilities(c);
+
+            if(gain != null)
+            {
+                caps.put("gain", gain);
+            }
+        }
+        catch(Exception e)
+        {
+            //best effort - omit on failure
+        }
+
+        return caps;
+    }
+
+    /**
+     * Best-effort list of the device's settable sample rates in Hz.  Returns an empty list for fixed-rate devices
+     * (FCD) or when the device does not expose an enumerable set.  Mirrors {@link #applySampleRate} exactly so the
+     * advertised rates are the same ones the endpoint will accept.
+     */
+    private List<Long> buildSampleRates(TunerController c)
+    {
+        List<Long> rates = new ArrayList<>();
+
+        if(c instanceof RTL2832TunerController)
+        {
+            for(RTL2832TunerController.SampleRate sr : RTL2832TunerController.SampleRate.values())
+            {
+                rates.add((long)sr.getRate());
+            }
+        }
+        else if(c instanceof HackRFTunerController)
+        {
+            for(HackRFTunerController.HackRFSampleRate sr : HackRFTunerController.HackRFSampleRate.VALID_SAMPLE_RATES)
+            {
+                rates.add((long)sr.getRate());
+            }
+        }
+        else if(c instanceof AirspyTunerController airspy)
+        {
+            for(AirspySampleRate sr : airspy.getSampleRates())
+            {
+                rates.add((long)sr.getRate());
+            }
+        }
+        else if(c instanceof HydraSdrTunerController hydra)
+        {
+            for(io.github.dsheirer.source.tuner.hydrasdr.HydraSdrSampleRate sr : hydra.getSampleRates())
+            {
+                rates.add((long)sr.getRate());
+            }
+        }
+        else if(c instanceof RspTunerController)
+        {
+            for(RspSampleRate sr : RspSampleRate.values())
+            {
+                rates.add(sr.getSampleRate());
+            }
+        }
+        else if(c instanceof AirspyHfTunerController hf)
+        {
+            for(AirspyHfSampleRate sr : hf.getAvailableSampleRates())
+            {
+                rates.add((long)sr.getSampleRate());
+            }
+        }
+        //FCD1 / FCD2 are fixed-rate - return empty list.
+
+        return rates;
+    }
+
+    /**
+     * Best-effort description of the device's gain model.  Returns null when the tuner type has no settable gain
+     * via this API.  The axes populated here mirror the ones {@link #applyGain} actually reads for each device.
+     */
+    private Map<String,Object> buildGainCapabilities(TunerController c)
+    {
+        //---------------------------------------------------------------------------------- RTL2832 family
+        if(c instanceof RTL2832TunerController rtl && rtl.hasEmbeddedTuner())
+        {
+            EmbeddedTuner embedded = rtl.getEmbeddedTuner();
+
+            if(embedded instanceof R8xEmbeddedTuner)
+            {
+                //R820T/R828D master gain labels are the raw composite gain values (tenths of a dB); the /gain
+                //endpoint snaps the requested {gain} number to the nearest of these - it is NOT a 0-based index.
+                Map<String,Object> gain = new LinkedHashMap<>();
+                gain.put("mode", "master");
+                gain.put("masterGainUnit", "value");
+                gain.put("masterGain", enumNumbers(R8xEmbeddedTuner.MasterGain.values()));
+                gain.put("agc", true);
+                return gain;
+            }
+
+            if(embedded instanceof E4KEmbeddedTuner)
+            {
+                //E4K master gain labels are dB figures (e.g. "16.5 db"); the /gain endpoint expects a dB value.
+                Map<String,Object> gain = new LinkedHashMap<>();
+                gain.put("mode", "master");
+                gain.put("masterGainUnit", "dB");
+                gain.put("masterGain", enumNumbers(E4KEmbeddedTuner.E4KGain.values()));
+                gain.put("agc", true);
+                return gain;
+            }
+
+            if(embedded instanceof FC0013EmbeddedTuner)
+            {
+                //FC0013 LNA gain labels are 0..23 step indexes; the /gain endpoint expects that index.
+                Map<String,Object> gain = new LinkedHashMap<>();
+                gain.put("mode", "master");
+                gain.put("masterGainUnit", "index");
+                gain.put("masterGain", enumNumbers(FC0013EmbeddedTuner.LNAGain.values()));
+                gain.put("agc", true);
+                return gain;
+            }
+
+            return null;
+        }
+
+        //---------------------------------------------------------------------------------- Airspy / HydraSDR
+        if(c instanceof AirspyTunerController || c instanceof HydraSdrTunerController)
+        {
+            //Both take a 1..22 gain level plus a LINEARITY/SENSITIVITY curve (see applyGain).
+            Map<String,Object> gain = new LinkedHashMap<>();
+            gain.put("mode", "master");
+            gain.put("masterGainUnit", "index");
+            gain.put("min", 1);
+            gain.put("max", 22);
+            gain.put("step", 1);
+            gain.put("gainModes", List.of("LINEARITY", "SENSITIVITY"));
+            return gain;
+        }
+
+        //---------------------------------------------------------------------------------- HackRF (two-axis + amp)
+        if(c instanceof HackRFTunerController)
+        {
+            List<Integer> lna = new ArrayList<>();
+
+            for(HackRFTunerController.HackRFLNAGain g : HackRFTunerController.HackRFLNAGain.values())
+            {
+                lna.add(g.getValue());
+            }
+
+            List<Integer> vga = new ArrayList<>();
+
+            for(HackRFTunerController.HackRFVGAGain g : HackRFTunerController.HackRFVGAGain.values())
+            {
+                vga.add(g.getValue());
+            }
+
+            Map<String,Object> gain = new LinkedHashMap<>();
+            gain.put("mode", "multi");
+            gain.put("unit", "dB");
+            gain.put("lnaGain", lna);
+            gain.put("vgaGain", vga);
+            gain.put("amp", true);
+            return gain;
+        }
+
+        //---------------------------------------------------------------------------------- SDRplay RSP
+        if(c instanceof RspTunerController rsp)
+        {
+            Map<String,Object> gain = new LinkedHashMap<>();
+            gain.put("mode", "multi");
+
+            Map<String,Object> lnaState = new LinkedHashMap<>();
+            lnaState.put("min", 0);
+
+            try
+            {
+                lnaState.put("max", rsp.getControlRsp().getMaximumLNASetting());
+            }
+            catch(Exception e)
+            {
+                //best effort - omit max if unavailable
+            }
+
+            gain.put("lnaState", lnaState);
+
+            Map<String,Object> gr = new LinkedHashMap<>();
+            gr.put("min", 20);
+            gr.put("max", 59);
+            gr.put("unit", "dB");
+            gain.put("gainReduction", gr);
+            return gain;
+        }
+
+        //---------------------------------------------------------------------------------- FUNcube Dongle Pro V1
+        if(c instanceof FCD1TunerController)
+        {
+            Map<String,Object> gain = new LinkedHashMap<>();
+            gain.put("mode", "master");
+            gain.put("masterGainUnit", "dB");
+            gain.put("masterGain", enumSignedNumbers(FCD1TunerController.LNAGain.values()));
+            return gain;
+        }
+
+        //---------------------------------------------------------------------------------- FUNcube Dongle Pro+ V2
+        if(c instanceof FCD2TunerController)
+        {
+            //Pro+ V2 exposes only an LNA on/off switch (see applyGain - body {enabled|gain>0}).
+            Map<String,Object> gain = new LinkedHashMap<>();
+            gain.put("mode", "toggle");
+            gain.put("lna", true);
+            return gain;
+        }
+
+        //---------------------------------------------------------------------------------- Airspy HF+ (attenuation + LNA)
+        if(c instanceof AirspyHfTunerController)
+        {
+            //applyGain snaps {attenuation} to Attenuation.getValue(), which is the 0..N index (label is the dB).
+            List<Integer> attValues = new ArrayList<>();
+            List<String> attLabels = new ArrayList<>();
+
+            for(Attenuation a : Attenuation.values())
+            {
+                attValues.add((int)a.getValue());
+                attLabels.add(a.toString());
+            }
+
+            Map<String,Object> att = new LinkedHashMap<>();
+            att.put("unit", "index");
+            att.put("min", attValues.isEmpty() ? 0 : attValues.get(0));
+            att.put("max", attValues.isEmpty() ? 0 : attValues.get(attValues.size() - 1));
+            att.put("values", attValues);
+            att.put("labels", attLabels);
+
+            Map<String,Object> gain = new LinkedHashMap<>();
+            gain.put("mode", "multi");
+            gain.put("attenuation", att);
+            gain.put("lna", true);
+            return gain;
+        }
+
+        return null;
+    }
+
+    /**
+     * Extracts the leading numeric label from each enum constant's {@code toString()} (via {@link #parseLeadingNumber}),
+     * in declaration order, skipping constants with no numeric label (e.g. AUTOMATIC / MANUAL).  Used to publish the
+     * discrete gain steps a device accepts.
+     */
+    private static List<Double> enumNumbers(Object[] values)
+    {
+        List<Double> numbers = new ArrayList<>();
+
+        for(Object v : values)
+        {
+            Double number = parseLeadingNumber(String.valueOf(v));
+
+            if(number != null)
+            {
+                numbers.add(number);
+            }
+        }
+
+        return numbers;
+    }
+
+    /**
+     * Extracts the signed numeric value from each enum constant's {@code name()} (via {@link #parseSignedName}), in
+     * declaration order, skipping constants with no magnitude.  Used for FCD1 LNA gain whose dB values are encoded in
+     * the constant name (e.g. LNA_GAIN_MINUS_5_0 -> -5.0).
+     */
+    private static List<Double> enumSignedNumbers(Enum<?>[] values)
+    {
+        List<Double> numbers = new ArrayList<>();
+
+        for(Enum<?> v : values)
+        {
+            Double number = parseSignedName(v.name());
+
+            if(number != null)
+            {
+                numbers.add(number);
+            }
+        }
+
+        return numbers;
     }
 
     private void handleTunerControl(HttpExchange exchange, String id, String action) throws IOException
