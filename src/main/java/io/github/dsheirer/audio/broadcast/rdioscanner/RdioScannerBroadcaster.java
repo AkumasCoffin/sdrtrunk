@@ -228,6 +228,22 @@ public class RdioScannerBroadcaster extends AbstractAudioBroadcaster<RdioScanner
                 float durationSeconds = (float)(audioRecording.getRecordingLength() / 1E3f);
                 long timestampSeconds = (int)(audioRecording.getStartTime() / 1E3);
                 String talkgroup = getTo(audioRecording);
+
+                //Node fix: a null/unhandled TO identifier resolves to talkgroup "0", which
+                //Rdio Scanner rejects as "Incomplete call data: no talkgroup". Uploading it
+                //just spams the server and can never be imported, so skip it here. Log the
+                //recording's full identifier set at WARN so the missing/unexpected TO can be
+                //root-caused (which decoder/state produced audio with no talkgroup).
+                if(talkgroup == null || talkgroup.isEmpty() || talkgroup.equals("0"))
+                {
+                    mLog.warn("Rdio Scanner API - skipping upload with no talkgroup (TO id missing) - system [" +
+                        getBroadcastConfiguration().getSystemID() + "] recording [" + audioRecording.getPath() +
+                        "] length [" + audioRecording.getRecordingLength() + "ms] identifiers " +
+                        audioRecording.getIdentifierCollection().getIdentifiers());
+                    audioRecording.removePendingReplay();
+                    continue;
+                }
+
                 String radioId = getFrom(audioRecording);
                 String talkerAlias = getTalkerAlias(audioRecording);
                 Long frequency = getFrequency(audioRecording);
@@ -485,7 +501,7 @@ public class RdioScannerBroadcaster extends AbstractAudioBroadcaster<RdioScanner
         Identifier identifier = audioRecording.getIdentifierCollection().getToIdentifier();
 
         StringBuilder sb = new StringBuilder();
-        if(identifier != null)
+        if(identifier != null && aliasList != null)
         {
             List<Alias> aliases = aliasList.getAliases(identifier);
             if(!aliases.isEmpty())
@@ -510,7 +526,7 @@ public class RdioScannerBroadcaster extends AbstractAudioBroadcaster<RdioScanner
         Identifier identifier = audioRecording.getIdentifierCollection().getToIdentifier();
 
         StringBuilder sb = new StringBuilder();
-        if(identifier != null)
+        if(identifier != null && aliasList != null)
         {
             List<Alias> aliases = aliasList.getAliases(identifier);
             if(!aliases.isEmpty())

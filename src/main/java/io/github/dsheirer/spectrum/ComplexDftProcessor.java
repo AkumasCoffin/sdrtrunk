@@ -70,6 +70,13 @@ public class ComplexDftProcessor<T extends INativeBuffer> implements Listener<T>
     {
         stop();
 
+        //Node fix: shut down the scheduled executor so its (non-daemon) worker thread
+        //terminates. Without this every dispose() leaked a live thread — e.g. each
+        //spectrum subscribe/unsubscribe cycle stranded one and blocked clean JVM exit.
+        //dispose() is terminal (a disposed processor is never restarted; SpectrumStreamer
+        //news up a fresh one per start), so shutting the executor down here is safe.
+        mExecutorService.shutdownNow();
+
         mListeners.clear();
         mWindow = null;
     }

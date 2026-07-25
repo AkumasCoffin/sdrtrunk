@@ -236,7 +236,10 @@ public class ControlServer
             ChannelModel cm = mPlaylistManager.getChannelModel();
 
             int tunerCount = mTunerManager.getDiscoveredTunerModel().getAvailableTuners().size();
-            List<Channel> channels = cm.getChannels();
+            // Snapshot the model's (JavaFX, non-thread-safe) channel list before iterating
+            // off the HTTP pool thread — traffic-channel add/remove + playlist reload mutate
+            // it concurrently, which would otherwise throw ConcurrentModificationException.
+            List<Channel> channels = new ArrayList<>(cm.getChannels());
             int channelCount = channels.size();
             int processing = 0;
 
@@ -1455,7 +1458,8 @@ public class ControlServer
 
         List<Map<String,Object>> list = new ArrayList<>();
 
-        for(Channel channel : cm.getChannels())
+        // Snapshot before iterating off-thread (JavaFX list, mutated by decode/reload).
+        for(Channel channel : new ArrayList<>(cm.getChannels()))
         {
             Map<String,Object> entry = new LinkedHashMap<>();
             entry.put("id", channel.getChannelID());
@@ -1652,7 +1656,8 @@ public class ControlServer
 
         Channel target = null;
 
-        for(Channel channel : cm.getChannels())
+        // Snapshot before iterating off-thread (JavaFX list, mutated by decode/reload).
+        for(Channel channel : new ArrayList<>(cm.getChannels()))
         {
             if(channel.getChannelID() == id)
             {
