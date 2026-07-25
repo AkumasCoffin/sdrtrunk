@@ -331,6 +331,13 @@ public class PlaylistManager implements Listener<ChannelEvent>
      */
     public void createEmptyPlaylist(Path path) throws IOException
     {
+        //Headless = a feeder node where the agent owns the playlist file. Never
+        //write an empty playlist over it (matches the save()/load() guards).
+        if(GraphicsEnvironment.isHeadless())
+        {
+            return;
+        }
+
         PlaylistV2 playlist = new PlaylistV2();
 
         try(OutputStream out = Files.newOutputStream(path))
@@ -528,26 +535,44 @@ public class PlaylistManager implements Listener<ChannelEvent>
         //Check for a lock file that indicates the previous save attempt was incomplete or had an error
         if(Files.exists(files.getPlaylistLock()))
         {
-            mLog.info("Previous playlist save was incomplete -- restoring from backup file (if possible)");
-
-            try
+            if(GraphicsEnvironment.isHeadless())
             {
-                //Remove the previous playlist
-                Files.delete(files.getPlaylist());
-
-                //Copy the backup file to restore the previous playlist
-                if(Files.exists(files.getPlaylistBackup()))
+                //Headless = a feeder node where the agent is the SOLE author of the
+                //playlist. NEVER restore the (possibly stale, e.g. enabled="true")
+                //backup over the agent's file — that would re-enable a channel the
+                //operator disabled. Just clear the stale lock so it doesn't recur.
+                try
                 {
-                    Files.copy(files.getPlaylistBackup(), files.getPlaylist());
+                    Files.delete(files.getPlaylistLock());
                 }
-
-                //Remove the lock file
-                Files.delete(files.getPlaylistLock());
+                catch(IOException ioe)
+                {
+                    mLog.error("Error clearing stale playlist lock file (headless)", ioe);
+                }
             }
-            catch(IOException ioe)
+            else
             {
-                mLog.error("Previous playlist save attempt was incomplete and there was an error restoring the " +
-                    "playlist backup file", ioe);
+                mLog.info("Previous playlist save was incomplete -- restoring from backup file (if possible)");
+
+                try
+                {
+                    //Remove the previous playlist
+                    Files.delete(files.getPlaylist());
+
+                    //Copy the backup file to restore the previous playlist
+                    if(Files.exists(files.getPlaylistBackup()))
+                    {
+                        Files.copy(files.getPlaylistBackup(), files.getPlaylist());
+                    }
+
+                    //Remove the lock file
+                    Files.delete(files.getPlaylistLock());
+                }
+                catch(IOException ioe)
+                {
+                    mLog.error("Previous playlist save attempt was incomplete and there was an error restoring the " +
+                        "playlist backup file", ioe);
+                }
             }
         }
 
