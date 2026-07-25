@@ -251,8 +251,14 @@ public class SDRTrunk implements Listener<TunerEvent>
         {
             mLog.info("starting main application headless");
             //No GUI to run the calibration dialog or click "install JMBE" — do both
-            //here, synchronously, so voice audio is available before channels start.
-            performHeadlessSetup(calibrationManager);
+            //here, synchronously, before channels start. On the genuine first run
+            //(work actually performed) restart once so channels come up with the
+            //calibration + JMBE fully applied (both are read at startup).
+            boolean didFirstRunWork = performHeadlessSetup(calibrationManager);
+            if(didFirstRunWork)
+            {
+                maybeRestartAfterFirstRunSetup();
+            }
         }
         else
         {
@@ -346,8 +352,10 @@ public class SDRTrunk implements Listener<TunerEvent>
      * Both persist, so subsequent starts skip straight through. Runs synchronously
      * (before channels auto-start) so voice audio is available when decoding begins.
      */
-    private void performHeadlessSetup(CalibrationManager calibrationManager)
+    private boolean performHeadlessSetup(CalibrationManager calibrationManager)
     {
+        boolean didWork = false;
+
         //1) CPU (vector/SIMD) calibration — normally a first-run dialog.
         try
         {
@@ -356,6 +364,7 @@ public class SDRTrunk implements Listener<TunerEvent>
                 mLog.info("headless: running one-time CPU calibration (this can take a minute)...");
                 calibrationManager.calibrate();
                 mLog.info("headless: CPU calibration complete");
+                didWork = true;
             }
             else
             {
@@ -372,12 +381,17 @@ public class SDRTrunk implements Listener<TunerEvent>
         //   audio to record/stream.
         try
         {
-            ensureJmbeLibraryHeadless();
+            if(ensureJmbeLibraryHeadless())
+            {
+                didWork = true;
+            }
         }
         catch(Exception e)
         {
             mLog.error("headless: JMBE auto-install failed; voice audio will be unavailable", e);
         }
+
+        return didWork;
     }
 
     /**
@@ -385,14 +399,14 @@ public class SDRTrunk implements Listener<TunerEvent>
      * building the latest release (the same flow as the GUI's JMBE editor) when
      * absent. No-op once installed.
      */
-    private void ensureJmbeLibraryHeadless() throws Exception
+    private boolean ensureJmbeLibraryHeadless() throws Exception
     {
         JmbeLibraryPreference jmbePref = mUserPreferences.getJmbeLibraryPreference();
         Path existing = jmbePref.getPathJmbeLibrary();
         if(existing != null && Files.exists(existing))
         {
             mLog.info("headless: JMBE audio library present [" + existing + "]");
-            return;
+            return false;
         }
 
         mLog.info("headless: JMBE audio library missing - auto-installing from GitHub (one-time)...");
@@ -400,7 +414,7 @@ public class SDRTrunk implements Listener<TunerEvent>
         if(release == null)
         {
             mLog.error("headless: could not resolve the latest JMBE release; voice audio unavailable");
-            return;
+            return false;
         }
 
         Path jmbeDir = mUserPreferences.getDirectoryPreference().getDirectoryApplicationRoot().resolve("jmbe");
@@ -425,11 +439,44 @@ public class SDRTrunk implements Listener<TunerEvent>
         {
             jmbePref.setPathJmbeLibrary(library);
             mLog.info("headless: JMBE audio library installed [" + library + "]");
+            return true;
         }
-        else
+
+        mLog.error("headless: JMBE library build did not complete; voice audio unavailable");
+        return false;
+    }
+
+    /**
+     * After a genuine first-run setup (calibration and/or JMBE install), restart
+     * SDR-Trunk so channels come up with the calibration + JMBE applied (both are
+     * read at startup). A marker file in the (writable) app root bounds this to a
+     * SINGLE restart, so even if the persisted "calibrated" flag / JMBE path fail
+     * to save (e.g. HOME not writable) this can never loop.
+     */
+    private void maybeRestartAfterFirstRunSetup()
+    {
+        Path marker = mUserPreferences.getDirectoryPreference().getDirectoryApplicationRoot()
+                .resolve(".headless-setup-restarted");
+
+        if(Files.exists(marker))
         {
-            mLog.error("headless: JMBE library build did not complete; voice audio unavailable");
+            mLog.warn("headless: first-run setup ran again but the restart marker is present - NOT restarting " +
+                    "(avoiding a loop). Calibration/JMBE prefs are not persisting; ensure HOME is writable.");
+            return;
         }
+
+        try
+        {
+            Files.writeString(marker, "restarted once after first-run calibration/JMBE setup\n");
+        }
+        catch(Exception e)
+        {
+            mLog.error("headless: could not write restart marker; NOT restarting (avoiding a possible loop)", e);
+            return;
+        }
+
+        mLog.info("headless: first-run setup complete - restarting SDR-Trunk so channels start with calibration + JMBE applied");
+        System.exit(0); //the node supervisor relaunches; the second run skips setup and auto-starts channels
     }
 
     /**
