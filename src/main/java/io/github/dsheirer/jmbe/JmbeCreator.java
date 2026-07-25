@@ -25,6 +25,7 @@ import io.github.dsheirer.jmbe.github.Release;
 import io.github.dsheirer.util.FileUtil;
 import io.github.dsheirer.util.OSType;
 import io.github.dsheirer.util.ThreadPool;
+import java.awt.GraphicsEnvironment;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -103,7 +104,32 @@ public class JmbeCreator
     {
         mConsoleStringBuilder.append(message).append("\n");
         final String console = mConsoleStringBuilder.toString();
-        Platform.runLater(() -> consoleOutputProperty().setValue(console));
+        if(GraphicsEnvironment.isHeadless())
+        {
+            //Headless node: the JavaFX toolkit isn't started, so Platform.runLater
+            //throws. Log to the application log and set the property directly.
+            mLog.info("JMBE install: " + message);
+            mConsoleOutput.setValue(console);
+        }
+        else
+        {
+            Platform.runLater(() -> consoleOutputProperty().setValue(console));
+        }
+    }
+
+    /**
+     * Runs the action on the JavaFX thread, or directly when headless (no FX toolkit).
+     */
+    private void fxRun(Runnable action)
+    {
+        if(GraphicsEnvironment.isHeadless())
+        {
+            action.run();
+        }
+        else
+        {
+            Platform.runLater(action);
+        }
     }
 
     /**
@@ -176,7 +202,7 @@ public class JmbeCreator
                                     if(exitCode == 0)
                                     {
                                         printToConsole("Library Created Successfully!");
-                                        Platform.runLater(() -> completeProperty().set(true));
+                                        fxRun(() -> completeProperty().set(true));
                                     }
                                     else
                                     {
@@ -239,7 +265,7 @@ public class JmbeCreator
     {
         printToConsole(message);
         printToConsole("Please follow the instructions for manually creating and installing the JMBE library");
-        Platform.runLater(() -> {
+        fxRun(() -> {
             mHasErrors = true;
             mCompleteProperty.set(true);
         });

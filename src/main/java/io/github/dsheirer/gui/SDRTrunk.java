@@ -64,6 +64,10 @@ import io.github.dsheirer.spectrum.SpectralDisplayPanel;
 import io.github.dsheirer.util.ThreadPool;
 import io.github.dsheirer.util.TimeStamp;
 import io.github.dsheirer.vector.calibrate.CalibrationManager;
+import io.github.dsheirer.jmbe.JmbeCreator;
+import io.github.dsheirer.jmbe.github.GitHub;
+import io.github.dsheirer.jmbe.github.Release;
+import io.github.dsheirer.preference.decoder.JmbeLibraryPreference;
 import java.awt.AWTException;
 import java.awt.Desktop;
 import java.awt.Dimension;
@@ -82,6 +86,8 @@ import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.Optional;
 import java.util.prefs.Preferences;
 import javafx.application.Platform;
@@ -244,6 +250,9 @@ public class SDRTrunk implements Listener<TunerEvent>
         if(GraphicsEnvironment.isHeadless())
         {
             mLog.info("starting main application headless");
+            //No GUI to run the calibration dialog or click "install JMBE" — do both
+            //here, synchronously, so voice audio is available before channels start.
+            performHeadlessSetup(calibrationManager);
         }
         else
         {
@@ -328,6 +337,98 @@ public class SDRTrunk implements Listener<TunerEvent>
             {
                 new ChannelAutoStartFrame(mPlaylistManager.getChannelProcessingManager(), channels, mUserPreferences);
             }
+        }
+    }
+
+    /**
+     * First-run setup for a HEADLESS node. There's no GUI to run the CPU
+     * calibration dialog or to click the "install JMBE" button, so do both here.
+     * Both persist, so subsequent starts skip straight through. Runs synchronously
+     * (before channels auto-start) so voice audio is available when decoding begins.
+     */
+    private void performHeadlessSetup(CalibrationManager calibrationManager)
+    {
+        //1) CPU (vector/SIMD) calibration — normally a first-run dialog.
+        try
+        {
+            if(!calibrationManager.isCalibrated())
+            {
+                mLog.info("headless: running one-time CPU calibration (this can take a minute)...");
+                calibrationManager.calibrate();
+                mLog.info("headless: CPU calibration complete");
+            }
+            else
+            {
+                mLog.info("headless: CPU calibration already done");
+            }
+        }
+        catch(Exception e)
+        {
+            mLog.error("headless: CPU calibration failed; continuing with default implementations", e);
+        }
+
+        //2) JMBE audio library (AMBE/IMBE voice codec) — required to produce voice
+        //   audio. Without it a call decodes + shows in Now Playing but yields no
+        //   audio to record/stream.
+        try
+        {
+            ensureJmbeLibraryHeadless();
+        }
+        catch(Exception e)
+        {
+            mLog.error("headless: JMBE auto-install failed; voice audio will be unavailable", e);
+        }
+    }
+
+    /**
+     * Ensures a JMBE audio library is installed and referenced, downloading +
+     * building the latest release (the same flow as the GUI's JMBE editor) when
+     * absent. No-op once installed.
+     */
+    private void ensureJmbeLibraryHeadless() throws Exception
+    {
+        JmbeLibraryPreference jmbePref = mUserPreferences.getJmbeLibraryPreference();
+        Path existing = jmbePref.getPathJmbeLibrary();
+        if(existing != null && Files.exists(existing))
+        {
+            mLog.info("headless: JMBE audio library present [" + existing + "]");
+            return;
+        }
+
+        mLog.info("headless: JMBE audio library missing - auto-installing from GitHub (one-time)...");
+        Release release = GitHub.getLatestRelease(JmbeCreator.GITHUB_JMBE_RELEASES_URL);
+        if(release == null)
+        {
+            mLog.error("headless: could not resolve the latest JMBE release; voice audio unavailable");
+            return;
+        }
+
+        Path jmbeDir = mUserPreferences.getDirectoryPreference().getDirectoryApplicationRoot().resolve("jmbe");
+        Files.createDirectories(jmbeDir);
+        Path library = jmbeDir.resolve("jmbe-" + release.getVersion() + ".jar");
+
+        JmbeCreator creator = new JmbeCreator(release, library);
+        CountDownLatch latch = new CountDownLatch(1);
+        creator.completeProperty().addListener((obs, oldV, complete) -> {
+            if(complete)
+            {
+                latch.countDown();
+            }
+        });
+        creator.execute(); //async build on a background thread
+        if(!creator.completeProperty().get())
+        {
+            latch.await(5, TimeUnit.MINUTES);
+        }
+
+        if(!creator.hasErrors() && Files.exists(library))
+        {
+            jmbePref.setPathJmbeLibrary(library);
+            mLog.info("headless: JMBE audio library installed [" + library + "]");
+        }
+        else
+        {
+            mLog.error("headless: JMBE library build did not complete; voice audio unavailable");
         }
     }
 
